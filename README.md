@@ -16,10 +16,12 @@ Because of this situation, I decided to work mainly with primary source data pub
 This repository is for the Excel-to-JSON converter that organizes official spreadsheet data into a format that is easier to handle in software.
 
 Scope of This Repository
+
 This public repository contains the data converter only.
 The app itself is being developed separately in a private repository. I chose to keep the application code private for now, while making the converter public because the conversion process itself may still be useful to others who want to work with the official Excel files.
 
 Data Source Policy
+
 This project uses primary source data published by the Ministry of Health, Labour and Welfare.
 Since medical DX is being promoted by the MHLW in Japan, I first thought that official data provided by the government would already be organized in a way that would be easier to use. In reality, I felt there was still room to reorganize the data into a more practical form for day-to-day work.
 So this project started from a simple idea: if the official data exists, I want to convert it into a form that is easier to reuse and handle.
