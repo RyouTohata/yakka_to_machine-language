@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-mhlw_price_converter_v6.py
+mhlw_price_converter_v6_1.py
 
 目的:
-    厚労省のExcel群を読み込み、以下の5表JSONを出力する。
+    厚労省のExcel群を読み込み、薬価アプリ向けのJSON群を出力する。
 
 出力:
     output/master_bundle.json
@@ -16,10 +16,10 @@ mhlw_price_converter_v6.py
     output/flags.json
     output/join_report.json
 
-5表:
+主要テーブル:
     - price_items
     - brand_items
-    - receipt_code_maps
+    - receipt_code_maps  ※現時点では入力ソース未指定のため空配列
     - generic_name_maps
     - flags
 
@@ -27,20 +27,34 @@ mhlw_price_converter_v6.py
     pip install pandas openpyxl
 
 使い方:
-    python mhlw_price_converter_v6.py --input-dir . --output-dir output
+    python mhlw_price_converter_v6_1.py --input-dir . --output-dir output
 
 任意:
-    python mhlw_price_converter_v6.py --input-dir . --output-dir output --manual-aliases manual_aliases.json
+    python mhlw_price_converter_v6_1.py --input-dir . --output-dir output --manual-aliases manual_aliases.json
+    python mhlw_price_converter_v6_1.py --input-dir . --output-dir output --config input_files.json
+
+input_files.json 例:
+    {
+      "base_files": [
+        "tp20260520-01_01.xlsx",
+        "tp20260520-01_02.xlsx",
+        "tp20260520-01_03.xlsx",
+        "tp20260401-01_04.xlsx"
+      ],
+      "aux05_file": "tp20260520-01_05.xlsx",
+      "kiso_file": "tp2026_kiso.xlsx"
+    }
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import unicodedata
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, is_dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -58,14 +72,14 @@ except ImportError:  # pragma: no cover
 # 設定
 # =========================================================
 
-BASE_FILE_NAMES = [
-    "tp20260415-01_01.xlsx",
-    "tp20260415-01_02.xlsx",
-    "tp20260415-01_03.xlsx",
-    "tp20260415-01_04.xlsx",
+DEFAULT_BASE_FILE_NAMES = [
+    "tp20260520-01_01.xlsx",
+    "tp20260520-01_02.xlsx",
+    "tp20260520-01_03.xlsx",
+    "tp20260401-01_04.xlsx",
 ]
-AUX05_FILE_NAME = "tp20260415-01_05.xlsx"
-KISO_FILE_NAME = "tp2026_kiso.xlsx"
+DEFAULT_AUX05_FILE_NAME = "tp20260520-01_05.xlsx"
+DEFAULT_KISO_FILE_NAME = "tp2026_kiso.xlsx"
 
 BASE_REQUIRED_COLUMNS = {
     "category": ["区分"],
@@ -153,15 +167,22 @@ MANUFACTURER_ALIASES = {
     "光製薬ヒカリセイヤク": "光製薬",
 }
 
-TOKEN_ALIASES = {
-    "Ｎａ": "ナトリウム",
-    "Na": "ナトリウム",
-    "ＣＲ": "CR",
-    "ＯＤ": "OD",
-    "ｍｇ": "mg",
-    "μg": "mcg",
+# 全フィールド共通。意味を変える置換は入れない。
+COMMON_TOKEN_ALIASES = {
     "㎎": "mg",
+    "μg": "mcg",
+    "㎍": "mcg",
+    "ｍｇ": "mg",
+    "ｍＬ": "mL",
+    "ＭＬ": "mL",
+    "ml": "mL",
     "　": " ",
+}
+
+# 成分名専用。Na は品名・メーカー名では無条件置換しない。
+INGREDIENT_TOKEN_ALIASES = {
+    **COMMON_TOKEN_ALIASES,
+    "Na": "ナトリウム",
 }
 
 DOSAGE_PATTERNS = [
@@ -182,6 +203,13 @@ DOSAGE_PATTERNS = [
 # =========================================================
 # dataclass
 # =========================================================
+
+@dataclass
+class InputFileConfig:
+    base_files: list[str] = field(default_factory=lambda: list(DEFAULT_BASE_FILE_NAMES))
+    aux05_file: str = DEFAULT_AUX05_FILE_NAME
+    kiso_file: str = DEFAULT_KISO_FILE_NAME
+
 
 @dataclass
 class SourceSummary:
@@ -210,7 +238,9 @@ class PriceItem:
     ingredient_normalized: str
     spec: str
     spec_normalized: str
-    price: Optional[float]
+
+    # v6.1: 金額はJSON上では文字列。Swift側で Decimal(string:) に渡す前提。
+    price: Optional[str]
     currency: str = "JPY"
 
     therapeutic_class_code: Optional[str] = None
@@ -256,6 +286,7 @@ class BrandItem:
     price_item_id: str
     mhlw_code: str
 
+    # TODO: YJ/HOTコードは別ソース導入後に実装する。
     yj_code: Optional[str]
     hot_code: Optional[str]
     name: str
@@ -357,13 +388,94 @@ class MasterBundle:
 
 
 # =========================================================
+# 欠損・JSON安全化
+# =========================================================
+
+def is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    try:
+        result = pd.isna(value)
+        if isinstance(result, bool):
+            return result
+        return False
+    except Exception:
+        return False
+
+
+def value_is_true(value: Any) -> bool:
+    if is_missing(value):
+        return False
+    try:
+        return bool(value) is True
+    except Exception:
+        return False
+
+
+def to_optional_float(value: Any) -> Optional[float]:
+    if is_missing(value):
+        return None
+    try:
+        f = float(value)
+    except Exception:
+        return None
+    if math.isnan(f) or math.isinf(f):
+        return None
+    return f
+
+
+def decimal_to_json_price(value: Optional[Decimal]) -> Optional[str]:
+    if value is None or is_missing(value):
+        return None
+    return str(value)
+
+
+def decimal_key(value: Any) -> str:
+    if is_missing(value):
+        return ""
+    try:
+        d = value if isinstance(value, Decimal) else Decimal(str(value))
+    except Exception:
+        return safe_str(value)
+    return format(d.normalize(), "f")
+
+
+def clean_json_value(value: Any) -> Any:
+    """json.dump(..., allow_nan=False) に渡せる値へ再帰的に変換する。"""
+    if is_dataclass(value):
+        return clean_json_value(asdict(value))
+    if isinstance(value, dict):
+        return {str(k): clean_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [clean_json_value(v) for v in value]
+    if isinstance(value, Decimal):
+        return decimal_to_json_price(value)
+    if isinstance(value, Path):
+        return str(value)
+    if is_missing(value):
+        return None
+    if hasattr(value, "item"):
+        try:
+            return clean_json_value(value.item())
+        except Exception:
+            pass
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    return value
+
+
+# =========================================================
 # 正規化
 # =========================================================
 
 def nfkc(text: Any) -> str:
     if text is None:
         return ""
-    if pd.isna(text):
+    if is_missing(text):
         return ""
     return unicodedata.normalize("NFKC", str(text)).strip()
 
@@ -372,45 +484,51 @@ def squash_spaces(text: Any) -> str:
     return SPACE_RE.sub(" ", nfkc(text)).strip()
 
 
-def normalize_text(text: Any) -> str:
-    s = squash_spaces(text)
-    for k, v in TOKEN_ALIASES.items():
+def apply_token_aliases(text: str, aliases: dict[str, str]) -> str:
+    s = text
+    for k, v in aliases.items():
         s = s.replace(k, v)
+    return s
+
+
+def normalize_text(text: Any, aliases: Optional[dict[str, str]] = None) -> str:
+    s = squash_spaces(text)
+    s = apply_token_aliases(s, aliases or COMMON_TOKEN_ALIASES)
     return squash_spaces(s)
 
 
 def normalize_name(text: Any) -> str:
-    s = normalize_text(text)
+    s = normalize_text(text, COMMON_TOKEN_ALIASES)
     s = s.replace("\n", " ")
     return squash_spaces(s)
 
 
 def normalize_ingredient(text: Any) -> str:
-    return normalize_text(text)
+    return normalize_text(text, INGREDIENT_TOKEN_ALIASES)
 
 
 def normalize_spec(text: Any) -> str:
-    s = normalize_text(text)
+    s = normalize_text(text, COMMON_TOKEN_ALIASES)
     s = s.replace("1 錠", "1錠").replace("1 g", "1g").replace("1 ml", "1mL").replace("1 ML", "1mL")
     return squash_spaces(s)
 
 
 def normalize_category(text: Any) -> str:
-    s = normalize_text(text)
+    s = normalize_text(text, COMMON_TOKEN_ALIASES)
     if s == "歯科用薬":
         return "歯科用薬剤"
     return s
 
 
 def normalize_manufacturer(text: Any) -> str:
-    s = normalize_text(text).replace(" ", "")
+    s = normalize_text(text, COMMON_TOKEN_ALIASES).replace(" ", "")
     return MANUFACTURER_ALIASES.get(s, s)
 
 
 def parse_price(value: Any) -> Optional[Decimal]:
-    if value is None or pd.isna(value):
+    if value is None or is_missing(value):
         return None
-    s = normalize_text(value).replace(",", "").replace("円", "")
+    s = normalize_text(value, COMMON_TOKEN_ALIASES).replace(",", "").replace("円", "")
     s = NON_NUMERIC_RE.sub("", s)
     if s in {"", "-", "—", ".", "-."}:
         return None
@@ -420,16 +538,23 @@ def parse_price(value: Any) -> Optional[Decimal]:
         return None
 
 
-def decimal_to_float(v: Optional[Decimal]) -> Optional[float]:
-    if v is None:
-        return None
-    return float(v)
+def price_to_sort_float(value: Any) -> float:
+    if is_missing(value):
+        return -1.0
+    try:
+        return float(value)
+    except Exception:
+        return -1.0
 
 
-def safe_str(v: Any) -> str:
-    if v is None or pd.isna(v):
+def safe_str(value: Any) -> str:
+    if value is None or is_missing(value):
         return ""
-    return str(v)
+    return str(value)
+
+
+def series_has_nonempty(series: pd.Series) -> bool:
+    return any(normalize_text(v) != "" for v in series.tolist())
 
 
 # =========================================================
@@ -454,6 +579,40 @@ def make_generic_name_map_id(generic_code: str, mhlw_code: str) -> str:
 
 def make_flag_id(owner_type: str, owner_id: str, flag_type: str) -> str:
     return f"flag:{owner_type}:{owner_id}:{flag_type}"
+
+
+# =========================================================
+# 設定ファイル
+# =========================================================
+
+def load_input_file_config(config_path: Optional[Path]) -> InputFileConfig:
+    if config_path is None:
+        return InputFileConfig()
+    if not config_path.exists():
+        raise FileNotFoundError(f"config file not found: {config_path}")
+
+    with config_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError("config JSON はオブジェクトである必要があります")
+
+    base_files = data.get("base_files", DEFAULT_BASE_FILE_NAMES)
+    aux05_file = data.get("aux05_file", DEFAULT_AUX05_FILE_NAME)
+    kiso_file = data.get("kiso_file", DEFAULT_KISO_FILE_NAME)
+
+    if not isinstance(base_files, list) or not all(isinstance(x, str) for x in base_files):
+        raise ValueError("config.base_files は文字列配列である必要があります")
+    if not isinstance(aux05_file, str):
+        raise ValueError("config.aux05_file は文字列である必要があります")
+    if not isinstance(kiso_file, str):
+        raise ValueError("config.kiso_file は文字列である必要があります")
+
+    return InputFileConfig(
+        base_files=base_files,
+        aux05_file=aux05_file,
+        kiso_file=kiso_file,
+    )
 
 
 # =========================================================
@@ -618,7 +777,7 @@ def load_base_master(paths: list[Path]) -> pd.DataFrame:
 
     base = pd.concat(frames, ignore_index=True)
 
-    base["code"] = base["code"].map(normalize_text)
+    base["code"] = base["code"].map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES))
     base["category"] = base["category"].map(normalize_category)
     base["ingredient"] = base["ingredient"].map(normalize_ingredient)
     base["spec"] = base["spec"].map(normalize_spec)
@@ -648,12 +807,12 @@ def load_aux05(path: Path) -> pd.DataFrame:
 
     length = len(raw)
     df = pd.DataFrame({
-        "code": get_series(raw, cols["code"], length).map(normalize_text),
-        "aux05_d": get_series(raw, cols["d"], length).map(normalize_text),
-        "aux05_e": get_series(raw, cols["e"], length).map(normalize_text),
-        "aux05_f": get_series(raw, cols["f"], length).map(normalize_text),
-        "aux05_g": get_series(raw, cols["g"], length).map(normalize_text),
-        "aux05_h": get_series(raw, cols["h"], length).map(normalize_text),
+        "code": get_series(raw, cols["code"], length).map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES)),
+        "aux05_d": get_series(raw, cols["d"], length).map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES)),
+        "aux05_e": get_series(raw, cols["e"], length).map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES)),
+        "aux05_f": get_series(raw, cols["f"], length).map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES)),
+        "aux05_g": get_series(raw, cols["g"], length).map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES)),
+        "aux05_h": get_series(raw, cols["h"], length).map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES)),
     })
 
     df = df[df["code"] != ""].drop_duplicates(subset=["code"]).copy()
@@ -701,10 +860,14 @@ def load_manual_aliases(path: Optional[Path]) -> list[dict[str, Any]]:
     return data
 
 
-def load_all_sources(input_dir: Path, manual_aliases_path: Optional[Path]) -> dict[str, Any]:
-    base_paths = [input_dir / name for name in BASE_FILE_NAMES]
-    aux05_path = input_dir / AUX05_FILE_NAME
-    kiso_path = input_dir / KISO_FILE_NAME
+def load_all_sources(
+    input_dir: Path,
+    manual_aliases_path: Optional[Path],
+    file_config: InputFileConfig,
+) -> dict[str, Any]:
+    base_paths = [input_dir / name for name in file_config.base_files]
+    aux05_path = input_dir / file_config.aux05_file
+    kiso_path = input_dir / file_config.kiso_file
 
     base = load_base_master(base_paths)
     aux05 = load_aux05(aux05_path)
@@ -757,20 +920,20 @@ def collect_mark_other(row: pd.Series) -> list[str]:
 def derive_flags(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    e = df["mark_e"].fillna("").map(normalize_text)
-    f = df["mark_f"].fillna("").map(normalize_text)
-    g = df["mark_g"].fillna("").map(normalize_text)
+    e = df["mark_e"].fillna("").map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES))
+    f = df["mark_f"].fillna("").map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES))
+    g = df["mark_g"].fillna("").map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES))
 
     df["mark_jp"] = e.eq("局") | f.eq("局") | g.eq("局")
     df["mark_narcotic"] = e.eq("麻") | f.eq("麻") | g.eq("麻")
     df["mark_other"] = df.apply(collect_mark_other, axis=1)
 
-    raw_j = df["raw_j"].fillna("").map(normalize_text)
-    raw_k = df["raw_k"].fillna("").map(normalize_text)
-    raw_l = df["raw_l"].fillna("").map(normalize_text)
-    raw_n = df["raw_n"].fillna("").map(normalize_text)
-    aux05_f = df["aux05_f"].fillna("").map(normalize_text)
-    aux05_h = df["aux05_h"].fillna("").map(normalize_text)
+    raw_j = df["raw_j"].fillna("").map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES))
+    raw_k = df["raw_k"].fillna("").map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES))
+    raw_l = df["raw_l"].fillna("").map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES))
+    raw_n = df["raw_n"].fillna("").map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES))
+    aux05_f = df["aux05_f"].fillna("").map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES))
+    aux05_h = df["aux05_h"].fillna("").map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES))
 
     df["is_generic_designated"] = raw_j.eq("後発品")
     df["is_originator_designated"] = raw_k.isin(["先発品", "準先発品"])
@@ -831,15 +994,29 @@ def build_exact6_key(df: pd.DataFrame) -> pd.Series:
         + "||"
         + df["manufacturer"].fillna("").astype(str)
         + "||"
-        + df["price"].astype(str)
+        + df["price"].map(decimal_key)
     )
 
 
 def build_key(df: pd.DataFrame, cols: list[str]) -> pd.Series:
-    s = df[cols[0]].fillna("").astype(str)
+    def part(col: str) -> pd.Series:
+        if col == "price":
+            return df[col].map(decimal_key)
+        return df[col].fillna("").astype(str)
+
+    s = part(cols[0])
     for c in cols[1:]:
-        s = s + "||" + df[c].fillna("").astype(str)
+        s = s + "||" + part(c)
     return s
+
+
+def prices_equal_or_missing(left: Any, right: Any) -> bool:
+    if is_missing(left) or is_missing(right):
+        return True
+    try:
+        return Decimal(str(left)) == Decimal(str(right))
+    except Exception:
+        return safe_str(left) == safe_str(right)
 
 
 def join_kiso(base: pd.DataFrame, kiso: pd.DataFrame, manual_aliases: list[dict[str, Any]]) -> tuple[pd.DataFrame, dict[str, int]]:
@@ -850,13 +1027,15 @@ def join_kiso(base: pd.DataFrame, kiso: pd.DataFrame, manual_aliases: list[dict[
         "unique_ing_spec_mfr": 0,
         "unique_ing_spec_price": 0,
         "manual_alias": 0,
-        "unresolved": 0,
-        "ambiguous": 0,
+        "no_match": 0,
+        "unresolved_ambiguous": 0,
+        "ambiguous_events": 0,
     }
 
     base["is_basic_medicine"] = None
     base["kiso_match_rule"] = None
     base["kiso_match_confidence"] = None
+    base["kiso_match_status"] = "unresolved"
 
     kiso_exact_keys = set(build_exact6_key(kiso).tolist())
     base_exact_keys = build_exact6_key(base)
@@ -865,6 +1044,7 @@ def join_kiso(base: pd.DataFrame, kiso: pd.DataFrame, manual_aliases: list[dict[
     base.loc[exact_mask, "is_basic_medicine"] = True
     base.loc[exact_mask, "kiso_match_rule"] = "exact6"
     base.loc[exact_mask, "kiso_match_confidence"] = 1.00
+    base.loc[exact_mask, "kiso_match_status"] = "matched"
     report["exact6"] = int(exact_mask.sum())
 
     unresolved_mask = base["is_basic_medicine"].isna()
@@ -880,13 +1060,15 @@ def join_kiso(base: pd.DataFrame, kiso: pd.DataFrame, manual_aliases: list[dict[
 
         if cnt == 1:
             hit = kiso[k2 == key].iloc[0]
-            if row["price"] == hit["price"] or row["price"] is None or hit["price"] is None:
+            if prices_equal_or_missing(row["price"], hit["price"]):
                 base.at[idx, "is_basic_medicine"] = True
                 base.at[idx, "kiso_match_rule"] = "unique_ing_spec_mfr"
                 base.at[idx, "kiso_match_confidence"] = 0.95
+                base.at[idx, "kiso_match_status"] = "matched"
                 report["unique_ing_spec_mfr"] += 1
         elif cnt > 1:
-            report["ambiguous"] += 1
+            base.at[idx, "kiso_match_status"] = "ambiguous"
+            report["ambiguous_events"] += 1
 
     unresolved_mask = base["is_basic_medicine"].isna()
 
@@ -896,16 +1078,21 @@ def join_kiso(base: pd.DataFrame, kiso: pd.DataFrame, manual_aliases: list[dict[
 
     for idx in base[unresolved_mask].index:
         row = base.loc[idx]
-        key = "||".join([safe_str(row[c]) for c in cols3])
+        key_parts = []
+        for c in cols3:
+            key_parts.append(decimal_key(row[c]) if c == "price" else safe_str(row[c]))
+        key = "||".join(key_parts)
         cnt = counts3.get(key, 0)
 
         if cnt == 1:
             base.at[idx, "is_basic_medicine"] = True
             base.at[idx, "kiso_match_rule"] = "unique_ing_spec_price"
             base.at[idx, "kiso_match_confidence"] = 0.90
+            base.at[idx, "kiso_match_status"] = "matched"
             report["unique_ing_spec_price"] += 1
         elif cnt > 1:
-            report["ambiguous"] += 1
+            base.at[idx, "kiso_match_status"] = "ambiguous"
+            report["ambiguous_events"] += 1
 
     unresolved_mask = base["is_basic_medicine"].isna()
 
@@ -921,11 +1108,22 @@ def join_kiso(base: pd.DataFrame, kiso: pd.DataFrame, manual_aliases: list[dict[
                 base.at[idx, "is_basic_medicine"] = True
                 base.at[idx, "kiso_match_rule"] = "manual_alias"
                 base.at[idx, "kiso_match_confidence"] = 0.85
+                base.at[idx, "kiso_match_status"] = "matched"
                 report["manual_alias"] += 1
                 break
 
     unresolved_mask = base["is_basic_medicine"].isna()
-    report["unresolved"] = int(unresolved_mask.sum())
+    ambiguous_mask = unresolved_mask & base["kiso_match_status"].eq("ambiguous")
+    no_match_mask = unresolved_mask & ~base["kiso_match_status"].eq("ambiguous")
+
+    base.loc[no_match_mask, "is_basic_medicine"] = False
+    base.loc[no_match_mask, "kiso_match_rule"] = "no_match"
+    base.loc[no_match_mask, "kiso_match_confidence"] = None
+    base.loc[no_match_mask, "kiso_match_status"] = "no_match"
+
+    # ambiguous は None のまま残す。False と区別するため。
+    report["no_match"] = int(no_match_mask.sum())
+    report["unresolved_ambiguous"] = int(ambiguous_mask.sum())
 
     return base, report
 
@@ -933,7 +1131,7 @@ def join_kiso(base: pd.DataFrame, kiso: pd.DataFrame, manual_aliases: list[dict[
 def sort_dataframe_for_output(df: pd.DataFrame) -> pd.DataFrame:
     sort_df = df.copy()
 
-    sort_df["price_sort"] = sort_df["price"].map(lambda x: float(x) if x is not None else -1.0)
+    sort_df["price_sort"] = sort_df["price"].map(price_to_sort_float)
     sort_df["originator_sort"] = sort_df["is_originator_designated"].map(lambda x: 0 if bool(x) else 1)
     sort_df["generic_equiv_sort"] = sort_df["has_generic_equivalent"].map(lambda x: 0 if bool(x) else 1)
 
@@ -954,9 +1152,9 @@ def sort_dataframe_for_output(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_flag_distribution(df: pd.DataFrame) -> dict[str, Any]:
-    basic_true = int((df["is_basic_medicine"] == True).sum())   # noqa: E712
-    basic_false = int((df["is_basic_medicine"] == False).sum()) # noqa: E712
-    basic_null = int(df["is_basic_medicine"].isna().sum())
+    basic_true = int(df["is_basic_medicine"].map(lambda x: x is True).sum())
+    basic_false = int(df["is_basic_medicine"].map(lambda x: x is False).sum())
+    basic_null = int(df["is_basic_medicine"].map(lambda x: x is None or is_missing(x)).sum())
 
     return {
         "is_generic_designated_true": int(df["is_generic_designated"].sum()),
@@ -985,7 +1183,7 @@ def build_sample_hits(df: pd.DataFrame, keywords: list[str], limit_per_keyword: 
                 "name": safe_str(r["name"]),
                 "ingredient": safe_str(r["ingredient"]),
                 "manufacturer": safe_str(r["manufacturer"]),
-                "price": decimal_to_float(r["price"]),
+                "price": decimal_to_json_price(r["price"]),
                 "is_generic_designated": bool(r["is_generic_designated"]),
                 "is_originator_designated": bool(r["is_originator_designated"]),
                 "has_generic_equivalent": bool(r["has_generic_equivalent"]),
@@ -993,6 +1191,7 @@ def build_sample_hits(df: pd.DataFrame, keywords: list[str], limit_per_keyword: 
                 "originator_price_marker": safe_str(r.get("originator_price_marker")) or None,
                 "generic_info_available": bool(r["generic_info_available"]),
                 "is_basic_medicine": r["is_basic_medicine"],
+                "kiso_match_status": safe_str(r.get("kiso_match_status")) or None,
                 "is_transitional": bool(r["is_transitional"]),
                 "aux05_f": safe_str(r.get("aux05_f")) or None,
                 "aux05_g": safe_str(r.get("aux05_g")) or None,
@@ -1061,7 +1260,7 @@ def build_meta_info(source_files: list[str]) -> MetaInfo:
     return MetaInfo(
         schema_version="1.1.0",
         generated_at=make_jst_now_iso(),
-        generator="mhlw_price_converter_v6",
+        generator="mhlw_price_converter_v6_1",
         source_files=source_files,
     )
 
@@ -1101,7 +1300,7 @@ def pick_representative_value(series: pd.Series) -> str:
 
 
 def pick_representative_decimal(series: pd.Series) -> Optional[Decimal]:
-    values = [v for v in series.tolist() if v is not None and not pd.isna(v)]
+    values = [v for v in series.tolist() if not is_missing(v)]
     if not values:
         return None
     vc = pd.Series([str(v) for v in values]).value_counts()
@@ -1110,6 +1309,14 @@ def pick_representative_decimal(series: pd.Series) -> Optional[Decimal]:
         return Decimal(top)
     except Exception:
         return values[0]
+
+
+def pick_optional_float(series: pd.Series) -> Optional[float]:
+    for value in series.tolist():
+        f = to_optional_float(value)
+        if f is not None:
+            return f
+    return None
 
 
 def collect_price_item_conflicts(code: str, group_df: pd.DataFrame) -> dict[str, list[str]]:
@@ -1121,7 +1328,7 @@ def collect_price_item_conflicts(code: str, group_df: pd.DataFrame) -> dict[str,
         if len(vals) > 1:
             result[col] = vals
 
-    price_vals = sorted({safe_str(v) for v in group_df["price"].tolist() if safe_str(v) != ""})
+    price_vals = sorted({decimal_key(v) for v in group_df["price"].tolist() if decimal_key(v) != ""})
     if len(price_vals) > 1:
         result["price"] = price_vals
 
@@ -1137,6 +1344,17 @@ def merge_text_candidates(values: list[str]) -> Optional[str]:
     return " / ".join(unique_values)
 
 
+def group_any_true(group_df: pd.DataFrame, col: str) -> bool:
+    return bool(group_df[col].map(value_is_true).any())
+
+
+def first_row_where_true(group_df: pd.DataFrame, col: str) -> pd.Series:
+    mask = group_df[col].map(value_is_true)
+    if bool(mask.any()):
+        return group_df[mask].iloc[0]
+    return group_df.iloc[0]
+
+
 def build_price_item_from_group(code: str, group_df: pd.DataFrame) -> PriceItem:
     row0 = group_df.iloc[0]
 
@@ -1144,7 +1362,7 @@ def build_price_item_from_group(code: str, group_df: pd.DataFrame) -> PriceItem:
     ingredient = pick_representative_value(group_df["ingredient"])
     spec = pick_representative_value(group_df["spec"])
     price_decimal = pick_representative_decimal(group_df["price"])
-    price = decimal_to_float(price_decimal)
+    price = decimal_to_json_price(price_decimal)
 
     conflicts = collect_price_item_conflicts(code, group_df)
 
@@ -1182,9 +1400,9 @@ def build_price_item_from_group(code: str, group_df: pd.DataFrame) -> PriceItem:
 
     source_summary = SourceSummary(
         base_files=base_files,
-        aux05_present=bool(group_df["aux05_d"].notna().any() or group_df["aux05_e"].notna().any()),
-        kiso_match_rule=safe_str(row0.get("kiso_match_rule")) or None,
-        kiso_match_confidence=float(row0["kiso_match_confidence"]) if row0.get("kiso_match_confidence") is not None else None,
+        aux05_present=series_has_nonempty(group_df["aux05_d"]) or series_has_nonempty(group_df["aux05_e"]),
+        kiso_match_rule=pick_representative_value(group_df["kiso_match_rule"]) or None,
+        kiso_match_confidence=pick_optional_float(group_df["kiso_match_confidence"]),
     )
 
     return PriceItem(
@@ -1217,7 +1435,7 @@ def build_brand_item(row: pd.Series, price_item_id: str, serial: int) -> BrandIt
     name = safe_str(row["name"])
     manufacturer = safe_str(row["manufacturer"])
 
-    price_value = decimal_to_float(row["price"])
+    price_value = price_to_sort_float(row["price"])
     is_originator_designated = bool(row.get("is_originator_designated"))
     has_generic_equivalent = bool(row.get("has_generic_equivalent"))
 
@@ -1238,7 +1456,7 @@ def build_brand_item(row: pd.Series, price_item_id: str, serial: int) -> BrandIt
         display_name=name,
         search_text=" ".join(filter(None, [name, manufacturer, safe_str(row.get("ingredient"))])).strip(),
         sort_keys=BrandSortKeys(
-            price_desc=price_value if price_value is not None else -1.0,
+            price_desc=price_value,
             originator_first=0 if is_originator_designated else 1,
             generic_equivalent_first=0 if has_generic_equivalent else 1,
             name=name,
@@ -1492,7 +1710,8 @@ def build_flags(merged_df: pd.DataFrame, brand_items: list[BrandItem]) -> list[F
         row0 = group.iloc[0]
         price_item_id = make_price_item_id(code)
 
-        if bool(row0.get("mark_jp")):
+        if group_any_true(group, "mark_jp"):
+            row = first_row_where_true(group, "mark_jp")
             flags.append(
                 build_flag_item(
                     owner_type="price_item",
@@ -1502,16 +1721,17 @@ def build_flags(merged_df: pd.DataFrame, brand_items: list[BrandItem]) -> list[F
                     value_type="boolean",
                     columns=["mark_e", "mark_f", "mark_g"],
                     values=[
-                        safe_str(row0.get("mark_e")),
-                        safe_str(row0.get("mark_f")),
-                        safe_str(row0.get("mark_g")),
+                        safe_str(row.get("mark_e")),
+                        safe_str(row.get("mark_f")),
+                        safe_str(row.get("mark_g")),
                     ],
                     derived_by="rule:any(mark_e,mark_f,mark_g)==局",
                     ui_badge="局",
                 )
             )
 
-        if bool(row0.get("mark_narcotic")):
+        if group_any_true(group, "mark_narcotic"):
+            row = first_row_where_true(group, "mark_narcotic")
             flags.append(
                 build_flag_item(
                     owner_type="price_item",
@@ -1521,17 +1741,21 @@ def build_flags(merged_df: pd.DataFrame, brand_items: list[BrandItem]) -> list[F
                     value_type="boolean",
                     columns=["mark_e", "mark_f", "mark_g"],
                     values=[
-                        safe_str(row0.get("mark_e")),
-                        safe_str(row0.get("mark_f")),
-                        safe_str(row0.get("mark_g")),
+                        safe_str(row.get("mark_e")),
+                        safe_str(row.get("mark_f")),
+                        safe_str(row.get("mark_g")),
                     ],
                     derived_by="rule:any(mark_e,mark_f,mark_g)==麻",
                     ui_badge="麻",
                 )
             )
 
-        mark_other = row0.get("mark_other")
-        if isinstance(mark_other, list) and mark_other:
+        mark_other_values: list[str] = []
+        for v in group["mark_other"].tolist():
+            if isinstance(v, list):
+                mark_other_values.extend(v)
+        mark_other = list(dict.fromkeys([v for v in mark_other_values if v]))
+        if mark_other:
             flags.append(
                 build_flag_item(
                     owner_type="price_item",
@@ -1541,16 +1765,17 @@ def build_flags(merged_df: pd.DataFrame, brand_items: list[BrandItem]) -> list[F
                     value_type="string_list",
                     columns=["mark_e", "mark_f", "mark_g"],
                     values=[
-                        safe_str(row0.get("mark_e")),
-                        safe_str(row0.get("mark_f")),
-                        safe_str(row0.get("mark_g")),
+                        pick_representative_value(group["mark_e"]),
+                        pick_representative_value(group["mark_f"]),
+                        pick_representative_value(group["mark_g"]),
                     ],
                     derived_by="rule:collect_mark_other",
                     ui_badge=None,
                 )
             )
 
-        if bool(row0.get("is_transitional")):
+        if group_any_true(group, "is_transitional"):
+            row = first_row_where_true(group, "is_transitional")
             flags.append(
                 build_flag_item(
                     owner_type="price_item",
@@ -1560,17 +1785,18 @@ def build_flags(merged_df: pd.DataFrame, brand_items: list[BrandItem]) -> list[F
                     value_type="boolean",
                     columns=["raw_n", "aux05_f", "aux05_g", "raw_o"],
                     values=[
-                        safe_str(row0.get("raw_n")),
-                        safe_str(row0.get("aux05_f")),
-                        safe_str(row0.get("aux05_g")),
-                        safe_str(row0.get("raw_o")),
+                        safe_str(row.get("raw_n")),
+                        safe_str(row.get("aux05_f")),
+                        safe_str(row.get("aux05_g")),
+                        safe_str(row.get("raw_o")),
                     ],
-                    derived_by="rule:raw_n != '' or aux05_f != ''",
+                    derived_by="rule:any(raw_n != '' or aux05_f != '') in code group",
                     ui_badge="経過措置",
                 )
             )
 
-        if bool(row0.get("excluded_from_addon")):
+        if group_any_true(group, "excluded_from_addon"):
+            row = first_row_where_true(group, "excluded_from_addon")
             flags.append(
                 build_flag_item(
                     owner_type="price_item",
@@ -1579,14 +1805,16 @@ def build_flags(merged_df: pd.DataFrame, brand_items: list[BrandItem]) -> list[F
                     value=True,
                     value_type="boolean",
                     columns=["aux05_h"],
-                    values=[safe_str(row0.get("aux05_h"))],
-                    derived_by="rule:aux05_h != ''",
+                    values=[safe_str(row.get("aux05_h"))],
+                    derived_by="rule:any(aux05_h != '') in code group",
                     ui_badge="除外",
                 )
             )
 
-        if row0.get("is_basic_medicine") is True:
-            conf = float(row0["kiso_match_confidence"]) if row0.get("kiso_match_confidence") is not None else None
+        basic_mask = group["is_basic_medicine"].map(lambda x: x is True)
+        if bool(basic_mask.any()):
+            row = group[basic_mask].iloc[0]
+            conf = to_optional_float(row.get("kiso_match_confidence"))
             flags.append(
                 build_flag_item(
                     owner_type="price_item",
@@ -1596,13 +1824,13 @@ def build_flags(merged_df: pd.DataFrame, brand_items: list[BrandItem]) -> list[F
                     value_type="boolean",
                     columns=["category", "ingredient", "spec", "manufacturer", "price"],
                     values=[
-                        safe_str(row0.get("category")),
-                        safe_str(row0.get("ingredient")),
-                        safe_str(row0.get("spec")),
-                        safe_str(row0.get("manufacturer")),
-                        safe_str(row0.get("price")),
+                        safe_str(row.get("category")),
+                        safe_str(row.get("ingredient")),
+                        safe_str(row.get("spec")),
+                        safe_str(row.get("manufacturer")),
+                        decimal_key(row.get("price")),
                     ],
-                    derived_by=f"rule:{safe_str(row0.get('kiso_match_rule')) or 'unknown'}",
+                    derived_by=f"rule:{safe_str(row.get('kiso_match_rule')) or 'unknown'}",
                     confidence=conf,
                     ui_badge="基礎的",
                 )
@@ -1613,6 +1841,10 @@ def build_flags(merged_df: pd.DataFrame, brand_items: list[BrandItem]) -> list[F
 
 def build_receipt_code_maps(merged_df: pd.DataFrame) -> list[ReceiptCodeMap]:
     _ = merged_df
+    # TODO:
+    #   現時点の入力Excel群には、レセプト電算コードへ確実に接続できる列を指定していない。
+    #   不確実な推定マップを作るより、空配列として明示する。
+    #   導入時は source_name / mapping_confidence / mapping_status を必ず付与する。
     return []
 
 
@@ -1671,6 +1903,11 @@ def build_master_bundle(merged_df: pd.DataFrame, join_report: dict[str, Any]) ->
 
     join_report = dict(join_report)
     join_report["flag_dedupe_report"] = flag_dedupe_report
+    join_report["implementation_notes"] = {
+        "receipt_code_maps": "未実装。入力ソース未指定のため空配列。",
+        "price_json_type": "string Decimal。Swift側では Decimal(string:) 推奨。",
+        "is_basic_medicine": "true=一致、false=明確な非一致、null=曖昧で未解決。",
+    }
 
     attach_relations(
         price_items=price_items,
@@ -1684,7 +1921,7 @@ def build_master_bundle(merged_df: pd.DataFrame, join_report: dict[str, Any]) ->
         meta=MetaInfo(
             schema_version="1.1.0",
             generated_at="",
-            generator="mhlw_price_converter_v6",
+            generator="mhlw_price_converter_v6_1",
             source_files=[],
         ),
         price_items=price_items,
@@ -1710,19 +1947,22 @@ def build_master_bundle_from_merged(
 # Writer
 # =========================================================
 
-def write_master_bundle_json(bundle: MasterBundle, out_path: Path) -> None:
+def write_json_safe(data: Any, out_path: Path) -> None:
+    clean_data = clean_json_value(data)
     with out_path.open("w", encoding="utf-8") as f:
-        json.dump(asdict(bundle), f, ensure_ascii=False, indent=2)
+        json.dump(clean_data, f, ensure_ascii=False, indent=2, allow_nan=False)
+
+
+def write_master_bundle_json(bundle: MasterBundle, out_path: Path) -> None:
+    write_json_safe(asdict(bundle), out_path)
 
 
 def write_table_json(records: list[Any], out_path: Path) -> None:
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump([asdict(x) for x in records], f, ensure_ascii=False, indent=2)
+    write_json_safe([asdict(x) for x in records], out_path)
 
 
 def write_report_json(report: dict[str, Any], out_path: Path) -> None:
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+    write_json_safe(report, out_path)
 
 
 def write_bundle_outputs(bundle: MasterBundle, output_dir: Path) -> None:
@@ -1742,15 +1982,16 @@ def write_bundle_outputs(bundle: MasterBundle, output_dir: Path) -> None:
 # =========================================================
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="MHLW Excel -> 5-table JSON converter")
+    parser = argparse.ArgumentParser(description="MHLW Excel -> JSON converter")
     parser.add_argument("--input-dir", type=Path, default=Path("."), help="Excelファイルのあるディレクトリ")
     parser.add_argument("--output-dir", type=Path, default=Path("output"), help="出力ディレクトリ")
     parser.add_argument("--manual-aliases", type=Path, default=None, help="manual_aliases.json のパス")
+    parser.add_argument("--config", type=Path, default=None, help="入力ファイル名設定JSONのパス")
     return parser.parse_args()
 
 
-def ensure_input_files(input_dir: Path) -> None:
-    required = BASE_FILE_NAMES + [AUX05_FILE_NAME, KISO_FILE_NAME]
+def ensure_input_files(input_dir: Path, file_config: InputFileConfig) -> None:
+    required = list(file_config.base_files) + [file_config.aux05_file, file_config.kiso_file]
     missing = [name for name in required if not (input_dir / name).exists()]
     if missing:
         raise FileNotFoundError(
@@ -1763,11 +2004,13 @@ def ensure_input_files(input_dir: Path) -> None:
 # =========================================================
 
 def run_converter(args: argparse.Namespace) -> None:
-    ensure_input_files(args.input_dir)
+    file_config = load_input_file_config(args.config)
+    ensure_input_files(args.input_dir, file_config)
 
     loaded = load_all_sources(
         input_dir=args.input_dir,
         manual_aliases_path=args.manual_aliases,
+        file_config=file_config,
     )
 
     merged_df, join_report = merge_source_tables(loaded)
@@ -1781,7 +2024,7 @@ def run_converter(args: argparse.Namespace) -> None:
     write_bundle_outputs(bundle, args.output_dir)
 
     print("done")
-    print(json.dumps(bundle.reports.join_report, ensure_ascii=False, indent=2))
+    print(json.dumps(clean_json_value(bundle.reports.join_report), ensure_ascii=False, indent=2, allow_nan=False))
 
 
 def main() -> int:
