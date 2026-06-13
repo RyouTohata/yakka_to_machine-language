@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-mhlw_price_converter_v6_1.py
+mhlw_price_converter_v6_2.py
 
 目的:
     厚労省のExcel群を読み込み、薬価アプリ向けのJSON群を出力する。
@@ -23,15 +23,24 @@ mhlw_price_converter_v6_1.py
     - generic_name_maps
     - flags
 
+v6.2 の主な変更:
+    - schema_version を 1.2.0 に更新
+      ※v6.1で price を JSON 上 string Decimal にしたため、スキーマ変更として明示。
+    - input_files.json の検証を強化
+      ※base_files 空配列、空文字、重複をエラーにする。
+    - join_report に input_file_config と _06 未処理メモを出力
+    - aux05 の薬価基準収載医薬品コード重複レポートを出力
+      ※load時は従来どおり code 単位で先頭1件に dedupe するが、捨てた可能性を可視化。
+
 依存:
     pip install pandas openpyxl
 
 使い方:
-    python mhlw_price_converter_v6_1.py --input-dir . --output-dir output
+    python mhlw_price_converter_v6_2.py --input-dir . --output-dir output
 
 任意:
-    python mhlw_price_converter_v6_1.py --input-dir . --output-dir output --manual-aliases manual_aliases.json
-    python mhlw_price_converter_v6_1.py --input-dir . --output-dir output --config input_files.json
+    python mhlw_price_converter_v6_2.py --input-dir . --output-dir output --manual-aliases manual_aliases.json
+    python mhlw_price_converter_v6_2.py --input-dir . --output-dir output --config input_files.json
 
 input_files.json 例:
     {
@@ -42,8 +51,13 @@ input_files.json 例:
         "tp20260401-01_04.xlsx"
       ],
       "aux05_file": "tp20260520-01_05.xlsx",
-      "kiso_file": "tp2026_kiso.xlsx"
+      "kiso_file": "tp2026_kiso.xlsx",
+      "temporary_exception_file": "tp20260520-01_06.xlsx"
     }
+
+注意:
+    temporary_exception_file は v6.2 では処理対象ではない。
+    join_report に未処理ファイルとして記録するための任意メタ情報。
 """
 
 from __future__ import annotations
@@ -72,6 +86,9 @@ except ImportError:  # pragma: no cover
 # 設定
 # =========================================================
 
+SCHEMA_VERSION = "1.2.0"
+GENERATOR_NAME = "mhlw_price_converter_v6_2"
+
 DEFAULT_BASE_FILE_NAMES = [
     "tp20260520-01_01.xlsx",
     "tp20260520-01_02.xlsx",
@@ -80,6 +97,7 @@ DEFAULT_BASE_FILE_NAMES = [
 ]
 DEFAULT_AUX05_FILE_NAME = "tp20260520-01_05.xlsx"
 DEFAULT_KISO_FILE_NAME = "tp2026_kiso.xlsx"
+DEFAULT_TEMPORARY_EXCEPTION_FILE_NAME = "tp20260520-01_06.xlsx"
 
 BASE_REQUIRED_COLUMNS = {
     "category": ["区分"],
@@ -210,6 +228,9 @@ class InputFileConfig:
     aux05_file: str = DEFAULT_AUX05_FILE_NAME
     kiso_file: str = DEFAULT_KISO_FILE_NAME
 
+    # v6.2: 処理はしない。join_report に未処理として記録するためのメタ情報。
+    temporary_exception_file: Optional[str] = DEFAULT_TEMPORARY_EXCEPTION_FILE_NAME
+
 
 @dataclass
 class SourceSummary:
@@ -239,7 +260,7 @@ class PriceItem:
     spec: str
     spec_normalized: str
 
-    # v6.1: 金額はJSON上では文字列。Swift側で Decimal(string:) に渡す前提。
+    # v6.1以降: 金額はJSON上では文字列。Swift側で Decimal(string:) に渡す前提。
     price: Optional[str]
     currency: str = "JPY"
 
@@ -410,6 +431,15 @@ def value_is_true(value: Any) -> bool:
         return False
     try:
         return bool(value) is True
+    except Exception:
+        return False
+
+
+def value_is_false(value: Any) -> bool:
+    if is_missing(value):
+        return False
+    try:
+        return bool(value) is False
     except Exception:
         return False
 
@@ -585,6 +615,17 @@ def make_flag_id(owner_type: str, owner_id: str, flag_type: str) -> str:
 # 設定ファイル
 # =========================================================
 
+def _normalize_file_name(value: Any, field_name: str, allow_none: bool = False) -> Optional[str]:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"config.{field_name} は文字列である必要があります")
+    s = value.strip()
+    if not s:
+        raise ValueError(f"config.{field_name} は空文字にできません")
+    return s
+
+
 def load_input_file_config(config_path: Optional[Path]) -> InputFileConfig:
     if config_path is None:
         return InputFileConfig()
@@ -597,21 +638,42 @@ def load_input_file_config(config_path: Optional[Path]) -> InputFileConfig:
     if not isinstance(data, dict):
         raise ValueError("config JSON はオブジェクトである必要があります")
 
-    base_files = data.get("base_files", DEFAULT_BASE_FILE_NAMES)
-    aux05_file = data.get("aux05_file", DEFAULT_AUX05_FILE_NAME)
-    kiso_file = data.get("kiso_file", DEFAULT_KISO_FILE_NAME)
+    raw_base_files = data.get("base_files", DEFAULT_BASE_FILE_NAMES)
+    raw_aux05_file = data.get("aux05_file", DEFAULT_AUX05_FILE_NAME)
+    raw_kiso_file = data.get("kiso_file", DEFAULT_KISO_FILE_NAME)
+    raw_temporary_exception_file = data.get("temporary_exception_file", DEFAULT_TEMPORARY_EXCEPTION_FILE_NAME)
 
-    if not isinstance(base_files, list) or not all(isinstance(x, str) for x in base_files):
+    if not isinstance(raw_base_files, list) or not all(isinstance(x, str) for x in raw_base_files):
         raise ValueError("config.base_files は文字列配列である必要があります")
-    if not isinstance(aux05_file, str):
-        raise ValueError("config.aux05_file は文字列である必要があります")
-    if not isinstance(kiso_file, str):
-        raise ValueError("config.kiso_file は文字列である必要があります")
+
+    base_files = [x.strip() for x in raw_base_files]
+    if not base_files:
+        raise ValueError("config.base_files は空配列にできません")
+    if any(x == "" for x in base_files):
+        raise ValueError("config.base_files に空文字は指定できません")
+
+    duplicated_base_files = sorted({x for x in base_files if base_files.count(x) > 1})
+    if duplicated_base_files:
+        raise ValueError("config.base_files に重複があります: " + ", ".join(duplicated_base_files))
+
+    aux05_file = _normalize_file_name(raw_aux05_file, "aux05_file")
+    kiso_file = _normalize_file_name(raw_kiso_file, "kiso_file")
+    temporary_exception_file = _normalize_file_name(
+        raw_temporary_exception_file,
+        "temporary_exception_file",
+        allow_none=True,
+    )
+
+    reserved = [*base_files, aux05_file, kiso_file]
+    duplicated_required_files = sorted({x for x in reserved if reserved.count(x) > 1})
+    if duplicated_required_files:
+        raise ValueError("入力ファイル指定に重複があります: " + ", ".join(duplicated_required_files))
 
     return InputFileConfig(
         base_files=base_files,
-        aux05_file=aux05_file,
-        kiso_file=kiso_file,
+        aux05_file=aux05_file or DEFAULT_AUX05_FILE_NAME,
+        kiso_file=kiso_file or DEFAULT_KISO_FILE_NAME,
+        temporary_exception_file=temporary_exception_file,
     )
 
 
@@ -712,7 +774,7 @@ def validate_base_df(df: pd.DataFrame) -> None:
             "spec_empty": int((group["spec"].fillna("") == "").all()),
         }
         if any(v == 1 for v in empties.values()):
-            bad_empty_groups[code] = empties
+            bad_empty_groups[str(code)] = empties
 
     if bad_empty_groups:
         sample = dict(list(bad_empty_groups.items())[:20])
@@ -795,7 +857,59 @@ def load_base_master(paths: list[Path]) -> pd.DataFrame:
     return base
 
 
-def load_aux05(path: Path) -> pd.DataFrame:
+def build_aux05_duplicate_report(df: pd.DataFrame, sample_limit: int = 20) -> dict[str, Any]:
+    if df.empty or "code" not in df.columns:
+        return {
+            "input_rows_after_code_filter": int(len(df)),
+            "unique_code_count": 0,
+            "duplicate_code_count": 0,
+            "duplicate_rows_to_drop": 0,
+            "conflicting_duplicate_code_count": 0,
+            "duplicate_code_samples": [],
+        }
+
+    counts = df["code"].value_counts(dropna=False)
+    duplicate_codes = [str(code) for code, count in counts.items() if str(code) != "" and int(count) > 1]
+    value_cols = ["aux05_d", "aux05_e", "aux05_f", "aux05_g", "aux05_h"]
+
+    samples: list[dict[str, Any]] = []
+    conflicting_count = 0
+
+    for code in duplicate_codes[:sample_limit]:
+        group = df[df["code"] == code]
+        unique_payload_count = int(group[value_cols].drop_duplicates().shape[0])
+        if unique_payload_count > 1:
+            conflicting_count += 1
+
+        row_samples = []
+        for _, r in group.head(5).iterrows():
+            row_samples.append({c: safe_str(r.get(c)) for c in ["code", *value_cols]})
+
+        samples.append({
+            "code": code,
+            "row_count": int(len(group)),
+            "unique_payload_count": unique_payload_count,
+            "has_conflict": unique_payload_count > 1,
+            "rows_sample": row_samples,
+        })
+
+    # sample外にも conflict がないか数える。
+    for code in duplicate_codes[sample_limit:]:
+        group = df[df["code"] == code]
+        if int(group[value_cols].drop_duplicates().shape[0]) > 1:
+            conflicting_count += 1
+
+    return {
+        "input_rows_after_code_filter": int(len(df)),
+        "unique_code_count": int(df["code"].nunique(dropna=True)),
+        "duplicate_code_count": int(len(duplicate_codes)),
+        "duplicate_rows_to_drop": int(len(df) - df["code"].nunique(dropna=True)),
+        "conflicting_duplicate_code_count": int(conflicting_count),
+        "duplicate_code_samples": samples,
+    }
+
+
+def load_aux05(path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
     raw = read_excel_auto_header(path)
 
     cols = resolve_columns(
@@ -815,9 +929,14 @@ def load_aux05(path: Path) -> pd.DataFrame:
         "aux05_h": get_series(raw, cols["h"], length).map(lambda x: normalize_text(x, COMMON_TOKEN_ALIASES)),
     })
 
-    df = df[df["code"] != ""].drop_duplicates(subset=["code"]).copy()
+    df = df[df["code"] != ""].copy()
+    duplicate_report = build_aux05_duplicate_report(df)
+
+    # 現行のJOINは code 単位。重複は先頭を残す。
+    # 重複の有無・内容差は duplicate_report に残す。
+    df = df.drop_duplicates(subset=["code"], keep="first").copy()
     validate_aux05_df(df)
-    return df
+    return df, duplicate_report
 
 
 def load_kiso(path: Path) -> pd.DataFrame:
@@ -870,9 +989,15 @@ def load_all_sources(
     kiso_path = input_dir / file_config.kiso_file
 
     base = load_base_master(base_paths)
-    aux05 = load_aux05(aux05_path)
+    aux05, aux05_duplicate_report = load_aux05(aux05_path)
     kiso = load_kiso(kiso_path)
     manual_aliases = load_manual_aliases(manual_aliases_path)
+
+    temporary_exception_path = (
+        input_dir / file_config.temporary_exception_file
+        if file_config.temporary_exception_file
+        else None
+    )
 
     return {
         "base": base,
@@ -880,6 +1005,16 @@ def load_all_sources(
         "kiso": kiso,
         "manual_aliases": manual_aliases,
         "source_files": [p.name for p in base_paths] + [aux05_path.name, kiso_path.name],
+        "input_file_config": asdict(file_config),
+        "aux05_duplicate_report": aux05_duplicate_report,
+        "unprocessed_optional_files": {
+            "temporary_exception_file": {
+                "file_name": file_config.temporary_exception_file,
+                "exists": bool(temporary_exception_path and temporary_exception_path.exists()),
+                "processed": False,
+                "reason": "v6.2では tp20260520-01_06.xlsx 等の臨時的取扱い表は未処理。必要時は別テーブル化する。",
+            }
+        },
     }
 
 
@@ -1152,8 +1287,8 @@ def sort_dataframe_for_output(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_flag_distribution(df: pd.DataFrame) -> dict[str, Any]:
-    basic_true = int(df["is_basic_medicine"].map(lambda x: x is True).sum())
-    basic_false = int(df["is_basic_medicine"].map(lambda x: x is False).sum())
+    basic_true = int(df["is_basic_medicine"].map(value_is_true).sum())
+    basic_false = int(df["is_basic_medicine"].map(value_is_false).sum())
     basic_null = int(df["is_basic_medicine"].map(lambda x: x is None or is_missing(x)).sum())
 
     return {
@@ -1216,11 +1351,17 @@ def merge_source_tables(loaded: dict[str, Any]) -> tuple[pd.DataFrame, dict[str,
     merged = sort_dataframe_for_output(merged)
 
     join_report = {
+        "schema_version": SCHEMA_VERSION,
+        "generator": GENERATOR_NAME,
+        "input_file_config": loaded.get("input_file_config", {}),
+        "source_files_processed": loaded.get("source_files", []),
+        "unprocessed_optional_files": loaded.get("unprocessed_optional_files", {}),
         "base_rows": int(len(base)),
         "aux05_rows": int(len(aux05)),
         "kiso_rows": int(len(kiso)),
         "joined_rows": int(len(merged)),
         "aux05_report": aux05_report,
+        "aux05_duplicate_report": loaded.get("aux05_duplicate_report", {}),
         "kiso_report": kiso_report,
         "flag_distribution": build_flag_distribution(merged),
         "sample_hits": build_sample_hits(
@@ -1258,9 +1399,9 @@ def make_jst_now_iso() -> str:
 
 def build_meta_info(source_files: list[str]) -> MetaInfo:
     return MetaInfo(
-        schema_version="1.1.0",
+        schema_version=SCHEMA_VERSION,
         generated_at=make_jst_now_iso(),
-        generator="mhlw_price_converter_v6_1",
+        generator=GENERATOR_NAME,
         source_files=source_files,
     )
 
@@ -1555,7 +1696,7 @@ def build_price_items(merged_df: pd.DataFrame) -> list[PriceItem]:
 
     grouped = merged_df.groupby("code", sort=False)
     for code, group in grouped:
-        price_items.append(build_price_item_from_group(code, group))
+        price_items.append(build_price_item_from_group(str(code), group))
 
     return price_items
 
@@ -1565,7 +1706,7 @@ def build_brand_items(merged_df: pd.DataFrame) -> list[BrandItem]:
 
     grouped = merged_df.groupby("code", sort=False)
     for code, group in grouped:
-        price_item_id = make_price_item_id(code)
+        price_item_id = make_price_item_id(str(code))
         seen_brand_keys: set[tuple[str, str, str]] = set()
         serial = 1
 
@@ -1707,8 +1848,7 @@ def build_flags(merged_df: pd.DataFrame, brand_items: list[BrandItem]) -> list[F
 
     grouped = merged_df.groupby("code", sort=False)
     for code, group in grouped:
-        row0 = group.iloc[0]
-        price_item_id = make_price_item_id(code)
+        price_item_id = make_price_item_id(str(code))
 
         if group_any_true(group, "mark_jp"):
             row = first_row_where_true(group, "mark_jp")
@@ -1811,7 +1951,7 @@ def build_flags(merged_df: pd.DataFrame, brand_items: list[BrandItem]) -> list[F
                 )
             )
 
-        basic_mask = group["is_basic_medicine"].map(lambda x: x is True)
+        basic_mask = group["is_basic_medicine"].map(value_is_true)
         if bool(basic_mask.any()):
             row = group[basic_mask].iloc[0]
             conf = to_optional_float(row.get("kiso_match_confidence"))
@@ -1907,6 +2047,9 @@ def build_master_bundle(merged_df: pd.DataFrame, join_report: dict[str, Any]) ->
         "receipt_code_maps": "未実装。入力ソース未指定のため空配列。",
         "price_json_type": "string Decimal。Swift側では Decimal(string:) 推奨。",
         "is_basic_medicine": "true=一致、false=明確な非一致、null=曖昧で未解決。",
+        "temporary_exception_06": "tp20260520-01_06.xlsx 等の臨時的取扱い表はv6.2では未処理。必要時は temporary_exception_items 等として別テーブル化する。",
+        "aux05_d": "aux05_d は読込済みだが、1/2/3/☆/★ の正式フラグ化は次版以降。現時点の後発品関連判定は主に base 表の raw_j/raw_k/raw_l に基づく。",
+        "aux05_dedupe": "aux05 は code 単位で先頭1件に dedupe。重複状況は aux05_duplicate_report を参照。",
     }
 
     attach_relations(
@@ -1919,9 +2062,9 @@ def build_master_bundle(merged_df: pd.DataFrame, join_report: dict[str, Any]) ->
 
     return MasterBundle(
         meta=MetaInfo(
-            schema_version="1.1.0",
+            schema_version=SCHEMA_VERSION,
             generated_at="",
-            generator="mhlw_price_converter_v6_1",
+            generator=GENERATOR_NAME,
             source_files=[],
         ),
         price_items=price_items,
