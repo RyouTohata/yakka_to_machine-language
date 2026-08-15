@@ -77,8 +77,6 @@ For the current recommended version, v6.2, run:
 ```bash
 python mhlw_price_converter_v6_2.py --input-dir . --output-dir output
 
-## Requirements
-
 - Python 3
 - pandas
 - openpyxl
