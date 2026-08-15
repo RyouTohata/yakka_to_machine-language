@@ -68,14 +68,7 @@ Older versions are intentionally retained as part of the development history.
 
 For new use, `mhlw_price_converter_v6_2.py` is the recommended version.
 
-## Usage
-
-Download the required MHLW Excel files and place them in the input directory.
-
-For the current recommended version, v6.2, run:
-
-```bash
-python mhlw_price_converter_v6_2.py --input-dir . --output-dir output
+## Requirements
 
 - Python 3
 - pandas
@@ -85,6 +78,24 @@ Install dependencies with:
 
 ```bash
 pip install -r requirements.txt
+```
+
+## Usage
+
+Download the required MHLW Excel files and place them in the input directory.
+
+For the current recommended version, v6.2, run:
+
+```bash
+python mhlw_price_converter_v6_2.py --input-dir . --output-dir output
+```
+
+The generated JSON files will be written to the specified output directory.
+
+The default input filenames are defined in the script. v6.2 also supports an optional input file configuration:
+
+```bash
+python mhlw_price_converter_v6_2.py --input-dir . --output-dir output --config input_files.json
 ```
 ## Known Limitations
 
