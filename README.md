@@ -79,3 +79,11 @@ Install dependencies with:
 ```bash
 pip install -r requirements.txt
 ```
+## Known Limitations
+
+The current recommended version, v6.2, has the following known limitations:
+
+- `receipt_code_maps` is currently empty because a reliable receipt-computer code source has not yet been integrated.
+- Temporary exception data such as `_06` is recorded as source metadata but is not processed in v6.2.
+- `aux05_d` is loaded, but its values (`1`, `2`, `3`, `☆`, `★`) are not yet converted into formal flags.
+- Duplicate records in `aux05` are deduplicated by MHLW code using the first record, while duplicate information is preserved in `join_report.json`.
