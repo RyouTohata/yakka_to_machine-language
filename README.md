@@ -41,3 +41,21 @@ This converter is not intended to replace official information.
 It is only a small tool to help process official data more easily.
 
 https://www.mhlw.go.jp/topics/2026/04/tp20260401-01.html
+
+## Versions
+
+This repository preserves several versions of the converter to document how the conversion logic evolved over time.
+
+| Version | Default input set | Notes                                                                                                                      |
+| ------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| v3      | April 1, 2026     | Early implementation using the April 1 MHLW files                                                                          |
+| v4      | April 1, 2026     | Intermediate development version based on the same April 1 source set                                                      |
+| v5      | April 15, 2026    | Updated for the April 15 revision; `_04` continues to use the April 1 file                                                 |
+| v6.2    | May 20, 2026      | Current version; `_04` continues to use the April 1 file. `_06` is recorded as an optional source but is not yet processed |
+
+All versions use the 2026 basic-medicine (`kiso`) source file where applicable.
+
+Older versions are intentionally retained as part of the development history.
+
+For new use, `mhlw_price_converter_v6_2.py` is the recommended version.
+
