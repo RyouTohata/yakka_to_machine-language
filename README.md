@@ -40,7 +40,16 @@ if the official data exists, I want to convert it into a form that is easier to 
 This converter is not intended to replace official information. 
 It is only a small tool to help process official data more easily.
 
+### Official MHLW Source
+
+The converter uses the official drug price list and related data published by the Ministry of Health, Labour and Welfare (MHLW).
+
+The MHLW source page is updated over time as drug price information changes. Therefore, each converter version in this repository identifies its source data by the Excel filenames configured in the script rather than by assuming that the current contents of the MHLW page correspond to that converter version.
+
+Official source:
 https://www.mhlw.go.jp/topics/2026/04/tp20260401-01.html
+
+See the Versions section below for the default input set used by each converter version.
 
 ## Versions
 
