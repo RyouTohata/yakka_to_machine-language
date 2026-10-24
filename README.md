@@ -87,7 +87,7 @@ Download the required MHLW Excel files and place them in the input directory.
 For the current recommended version, v6.2, run:
 
 ```bash
-python mhlw_price_converter_v6_2.py --input-dir . --output-dir output
+python3 mhlw_price_converter_v6_2.py --input-dir . --output-dir output
 ```
 
 The generated JSON files will be written to the specified output directory.
@@ -95,7 +95,7 @@ The generated JSON files will be written to the specified output directory.
 The default input filenames are defined in the script. v6.2 also supports an optional input file configuration:
 
 ```bash
-python mhlw_price_converter_v6_2.py --input-dir . --output-dir output --config input_files.json
+python3 mhlw_price_converter_v6_2.py --input-dir . --output-dir output --config input_files.json
 ```
 ## Known Limitations
 
